@@ -1,5 +1,6 @@
-import docker
-from docker.errors import ImageNotFound, DockerException
+import uuid
+import json
+import redis
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -7,64 +8,76 @@ app = FastAPI(
     title="CodeWarden API"
 )
 
+# Connect to Redis
 try:
-    client = docker.from_env()
-except Exception:
-    client = None
+    redis_client = redis.Redis(host='localhost',
+                               port=6379,
+                               db=0,
+                               decode_responses=True
+    )
+    redis_client.ping() # Test the connection immediately
+
+except redis.ConnectionError:
+    redis_client = None
 
 class ExecuteRequest(BaseModel):
     code: str
     language: str = "python"
 
 @app.post("/execute")
-def execute_code(payload: ExecuteRequest):
+def submit_code(payload: ExecuteRequest):
     if payload.language != "python":
         raise HTTPException(status_code=400, detail="Only Python is supported for NOW")
     
-    if not client:
-        raise HTTPException(status_code=500, detail="Docker daemon is not running or accessible.")
+    if not redis_client:
+        raise HTTPException(status_code=500, detail="Redis broker is not accessible.")
 
-    container = None
+    # 1. Generate a unique ID for this execution
+    job_id = str(uuid.uuid4())
+
+    # 2. Package the job details
+    job_data = {
+        "job_id": job_id,
+        "code": payload.code,
+        "language": payload.language,
+        "status": "queued"
+    }
+
     try:
-        # Spin up the sandbox with strict hardware and network limitations
-        container = client.containers.run(
-            image="python:3.9-alpine",
-            command=["timeout", "3", "python", "-uc", payload.code], # 'timeout 3' kills script if it hangs
-            detach=True,
-            mem_limit="128m",
-            init=True,
-            memswap_limit="128m", # 128 MB total memory, no swap space
-            cpu_period=100000,
-            cpu_quota=50000, # Cap at 50% of a single CPU core
-            network_mode="none", # Disable internet access
-            user="1000" # Run as non-root unprivileged user
+        # 3. Save initial status so the user can query it via GET /status
+        redis_client.set(
+            f"job_status:{job_id}",
+            json.dumps(job_data)
         )
 
-        # Block the API request until container finishes executing
-        result = container.wait()
+        # 4. Push the job to the back of the queue (rpush = Right Push)
+        redis_client.rpush(
+            "code_execution_queue",
+            json.dumps(job_data)
+        )
 
-        # Capture stdout and stderr
-        output = container.logs().decode("utf-8").strip()
+    except redis.RedisError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to queue job: {str(e)}"
+        )
 
-        # Exit code 143 (SIGTERM) is standard when 'timeout' kills a process
-        is_timeout = result["StatusCode"] == 143
+    # 5. Return immediately
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Job submitted successfully"
+    }
 
-        return {
-            "status": "timeout" if is_timeout else "success" if result["StatusCode"] == 0 else "error",
-            "exit_code": result["StatusCode"],
-            "output": output if output else "No output generated."
-        }
+@app.get("/status/{job_id}")
+def get_status(job_id: str):
+    if not redis_client:
+        raise HTTPException(status_code=500, detail="Redis broker is not accessible.")
 
-    except ImageNotFound:
-        raise HTTPException(status_code=500, detail="Docker image 'python:3.9-alpine' not found and could not be pulled. Run: docker pull python:3.9-alpine")
-    except DockerException as e:
-        raise HTTPException(status_code=500, detail=f"Docker engine error: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Container execution failed: {str(e)}")
-    finally:
-        # Always clean up container to prevent leaks
-        if container:
-            try:
-                container.remove(force=True)
-            except Exception:
-                pass
+    # Fetch the current state of the job from Redis
+    result = redis_client.get(f"job_status:{job_id}")
+
+    if not result:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return json.loads(result)
