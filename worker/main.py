@@ -6,6 +6,7 @@ import time
 
 # Connect to Redis and Docker
 try:
+    # decode_responses=True ensures we get strings back from Redis instead of raw bytes
     redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
     redis_client.ping()
 except redis.ConnectionError:
@@ -18,14 +19,16 @@ except Exception as e:
     print(f"FATAL: Could not connect to Docker Daemon. {e}")
     exit(1)
 
-def execute_sandbox(code: str) -> dict:
-    """Worker code"""
+def execute_sandbox(job_id: str,code: str) -> dict:
+    """Worker code ,Spins up the sandbox and streams output to Redis Pub/Sub."""
+
     container = None
+    pubsub_channel = f"stream:{job_id}"
     try:
         # Spin up the sandbox with strict hardware and network limitations
         container = docker_client.containers.run(
             image="python:3.9-alpine",
-            command=["timeout", "3", "python", "-uc", code],  # 'timeout 3' kills script if it hangs
+            command=["timeout", "60", "python", "-uc", code],  # 'timeout 3' kills script if it hangs
             detach=True,
             mem_limit="128m",
             init=True,
@@ -36,17 +39,27 @@ def execute_sandbox(code: str) -> dict:
             user="1000"  # Run as non-root unprivileged user
         )
 
+        full_output = []
+
+        # Read the logs as a live stream
+        for line in container.logs(stream=True):
+            decode_line = line.decode("utf-8")
+            full_output.append(decode_line)
+            # Publish each line to the Redis channel instantly
+            redis_client.publish(pubsub_channel,decode_line)
+
         result = container.wait()
 
-        # Capture stdout and stderr
-        output = container.logs().decode("utf-8").strip()
         # Exit code 143 (SIGTERM) is standard when 'timeout' kills a process
         is_timeout = result["StatusCode"] == 143
+
+        # Join the full output for the final database record
+        final_output_string = "".join(full_output).strip()
 
         return {
             "status": "timeout" if is_timeout else "success" if result["StatusCode"] == 0 else "error",
             "exit_code": result["StatusCode"],
-            "output": output if output else "No output generated."
+            "output": final_output_string if final_output_string else "No output generated."
         }
 
     except ImageNotFound:
@@ -90,7 +103,7 @@ def main():
             # The '0' means wait indefinitely without timing out.
             _, raw_job = redis_client.blpop(
                 "code_execution_queue",
-                0
+                0 # 0 means wait infinte
             )
 
             job = json.loads(raw_job)
@@ -108,8 +121,13 @@ def main():
             )
 
             # Run the Docker container
-            execution_result = execute_sandbox(code)
+            execution_result = execute_sandbox(job_id,code)
 
+            # Publish a final kill signal so the WebSocket knows to close
+            redis_client.publish(
+                f"stream:{job_id}",
+                "__EXECUTION_COMPLETE__"
+            )
             # Merge the results and update Redis with the final status
             job.update(execution_result)
             redis_client.set(  # to change in redis dict too
